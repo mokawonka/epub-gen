@@ -98,7 +98,7 @@ RETRY_ATTEMPTS      = 4
 RETRY_DELAY         = 30.0              # seconds for first retry; multiplied by attempt#
 
 # Google Gemini Imagen
-IMAGEN_MODEL        = "imagen-4.0-generate-001"
+IMAGEN_MODEL        = "imagen-4.0-ultra-generate-001"
 IMAGEN_ASPECT_RATIO = "3:4"             # portrait — closest to book cover ratio
 
 COVER_W             = 1400
@@ -760,7 +760,7 @@ def generate_image_imagen(
     if len(words) > 400:
         prompt = " ".join(words[:400])
 
-    model_chain = [model, "imagen-4.0-ultra-generate-001", "imagen-4.0-fast-generate-001"]
+    model_chain = [model, "imagen-4.0-generate-001", "imagen-4.0-fast-generate-001"]
     seen = set()
     model_chain = [m for m in model_chain if not (m in seen or seen.add(m))]
 
