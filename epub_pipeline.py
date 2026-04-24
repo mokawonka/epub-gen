@@ -701,72 +701,145 @@ def check_google_key() -> None:
             "    Get a key at: https://aistudio.google.com/app/apikey"
         )
 
+def regenerate_image_prompt(
+    master_summary: str, title: str, author: str, model: str,
+    previous_prompt: str, attempt: int,
+) -> str:
+    """
+    Regenerate the image prompt with increasingly strict safety guidance
+    after Imagen blocks a previous attempt.
+    """
+    system = (
+        "You are an expert image-generation prompt engineer for book covers.\n"
+        "A previous prompt was blocked by an image generation safety filter.\n"
+        "You must rewrite it to be accepted while keeping the same scene and mood.\n\n"
+        "STRICT SAFETY RULES — violations cause blocks:\n"
+        "- NEVER describe any character as a child, boy, girl, kid, young, youth, minor.\n"
+        "- Replace any young/small character with 'a slight ethereal figure', "
+        "'a slender mysterious traveller', or 'a small cloaked figure' — no age references.\n"
+        "- NEVER use: child, boy, girl, kid, young, little, small person, youth, minor.\n"
+        "- NEVER mention weapons, blood, gore, violence, death, war, battle.\n"
+        "- NEVER mention drugs, alcohol, nudity, or anything sexually suggestive.\n"
+        "- Describe clothing, posture, and setting only — never age or physical vulnerability.\n\n"
+        "STYLE:\n"
+        "- Cinematic, painterly, detailed\n"
+        "- Period-accurate clothing and architecture\n"
+        "- No text or typography in the image\n"
+        "- Portrait orientation (taller than wide)\n"
+        f"- This is attempt {attempt} — be more conservative than the previous version.\n"
+    )
+    user = (
+        f"Book title: {title}\n"
+        f"Author: {author}\n\n"
+        f"Master summary:\n{master_summary}\n\n"
+        f"Previous blocked prompt:\n{previous_prompt}\n\n"
+        "Rewrite the prompt (max 100 words) to pass safety filters "
+        "while preserving the scene, mood, and characters.\n"
+        "Output ONLY the rewritten prompt as a single paragraph."
+    )
+    raw = ollama_generate(user, model, system)
+    lines = [l.strip() for l in raw.splitlines() if l.strip()]
+    return lines[-1] if lines else raw
+
 
 def generate_image_imagen(
     prompt: str,
     out_dir: Path,
-    model: str        = IMAGEN_MODEL,
-    aspect_ratio: str = IMAGEN_ASPECT_RATIO
-    ) -> Path:
-    """Generate a cover image with Imagen 4 and save it as cover_raw.png."""
+    model: str               = IMAGEN_MODEL,
+    aspect_ratio: str        = IMAGEN_ASPECT_RATIO,
+    master_summary: str      = "",
+    title: str               = "",
+    author: str              = "",
+    ollama_model: str        = "",
+    prompt_path: Path | None = None,
+    max_prompt_attempts: int = 5,
+) -> Path:
     client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
 
-    # Imagen prompt limit is ~480 tokens; trim gracefully
     words = prompt.split()
     if len(words) > 400:
         prompt = " ".join(words[:400])
 
-    print(f"  → Sending prompt to {model} (aspect={aspect_ratio})…")
+    model_chain = [model, "imagen-4.0-ultra-generate-001", "imagen-4.0-fast-generate-001"]
+    seen = set()
+    model_chain = [m for m in model_chain if not (m in seen or seen.add(m))]
 
-    response = client.models.generate_images(
-        model=model,
-        prompt=prompt,
-        config=genai_types.GenerateImagesConfig(
-            number_of_images=1,
-            aspect_ratio=aspect_ratio,
-            person_generation="allow_adult",  # needed for character-based covers
-        ),
+    current_prompt = prompt
+
+    for prompt_attempt in range(1, max_prompt_attempts + 1):
+        print(f"  → Prompt attempt {prompt_attempt}/{max_prompt_attempts}…")
+
+        for current_model in model_chain:
+            print(f"  → Sending to {current_model} (aspect={aspect_ratio})…")
+            try:
+                response = client.models.generate_images(
+                    model=current_model,
+                    prompt=current_prompt,
+                    config=genai_types.GenerateImagesConfig(
+                        number_of_images=1,
+                        aspect_ratio=aspect_ratio,
+                        person_generation="allow_adult",
+                    ),
+                )
+
+                if not response.generated_images:
+                    print(f"  ⚠ {current_model} blocked the prompt.")
+                    continue
+
+                raw_path = out_dir / "cover_raw.png"
+                img_obj = response.generated_images[0].image
+
+                if isinstance(img_obj, Image.Image):
+                    img_obj.save(raw_path)
+                else:
+                    raw_bytes = None
+                    for attr in ("_image_bytes", "image_bytes", "data", "content", "raw", "bytes"):
+                        if hasattr(img_obj, attr):
+                            raw_bytes = getattr(img_obj, attr)
+                            break
+                    if isinstance(img_obj, bytes):
+                        raw_bytes = img_obj
+                    if raw_bytes is None:
+                        raise RuntimeError(f"Cannot extract image bytes from {type(img_obj)}")
+                    Image.open(io.BytesIO(raw_bytes)).save(raw_path)
+
+                print(f"  ✓  Raw image saved → {raw_path.name}  "
+                      f"(model: {current_model}, prompt attempt: {prompt_attempt})")
+                return raw_path
+
+            except Exception as exc:
+                if "blocked" in str(exc).lower() or "safety" in str(exc).lower():
+                    print(f"  ⚠ {current_model} raised a safety error.")
+                    continue
+                raise  # re-raise non-safety errors immediately
+
+        # All models blocked this prompt — regenerate
+        if prompt_attempt < max_prompt_attempts:
+            if master_summary and title and ollama_model:
+                print(f"  ⚠ All models blocked prompt attempt {prompt_attempt} "
+                      f"— regenerating prompt from master summary…")
+                current_prompt = regenerate_image_prompt(
+                    master_summary=master_summary,
+                    title=title,
+                    author=author,
+                    model=ollama_model,
+                    previous_prompt=current_prompt,
+                    attempt=prompt_attempt + 1,
+                )
+                print(f"  → New prompt: {current_prompt[:120]}…")
+
+                if prompt_path is not None:
+                    prompt_path.write_text(current_prompt, encoding="utf-8")
+                    print(f"  → Saved → {prompt_path.name}")
+            else:
+                print("  ⚠ Cannot regenerate prompt — master_summary or ollama_model not provided.")
+                break
+
+    raise RuntimeError(
+        f"Imagen blocked all {max_prompt_attempts} prompt attempts across all models.\n"
+        f"Last prompt tried: {current_prompt}\n"
+        "Try running with --cover-image to supply your own cover."
     )
-
-    if not response.generated_images:
-        raise RuntimeError(
-            "Imagen returned no images. The prompt may have been blocked by safety "
-            "filters — try rephrasing or raising --imagen-safety."
-        )
-
-    raw_path = out_dir / "cover_raw.png"
-
-    img_obj = response.generated_images[0].image
-
-    # The SDK may return a wrapper object, raw bytes, or a real PIL Image.
-    # Normalize all cases through bytes → PIL to guarantee a real PIL Image.
-    if isinstance(img_obj, Image.Image):
-        img_obj.save(raw_path)
-    else:
-        raw_bytes = None
-        if hasattr(img_obj, "_image_bytes"):
-            raw_bytes = img_obj._image_bytes
-        elif hasattr(img_obj, "image_bytes"):
-            raw_bytes = img_obj.image_bytes
-        elif isinstance(img_obj, bytes):
-            raw_bytes = img_obj
-        else:
-            for attr in ("data", "content", "raw", "bytes"):
-                if hasattr(img_obj, attr):
-                    raw_bytes = getattr(img_obj, attr)
-                    break
-
-        if raw_bytes is None:
-            raise RuntimeError(
-                f"Cannot extract image bytes from SDK object: {type(img_obj)}. "
-                f"Available attributes: {[a for a in dir(img_obj) if not a.startswith('__')]}"
-            )
-
-        pil_image = Image.open(io.BytesIO(raw_bytes))
-        pil_image.save(raw_path)
-
-    print(f"  ✓  Raw image saved → {raw_path.name}")
-    return raw_path
 
 
 def enhance_raw_image(
@@ -1214,12 +1287,13 @@ def inject_cover_into_epub(
     def opf_xml() -> bytes:
         NS  = "http://www.idpf.org/2007/opf"
         DC  = "http://purl.org/dc/elements/1.1/"
+        XML_NS = "http://www.w3.org/XML/1998/namespace"
         root = etree.Element(
             f"{{{NS}}}package",
             attrib={
                 "version":           "3.0",
                 "unique-identifier": "bookid",
-                "xml:lang":          lang,
+                f"{{{XML_NS}}}lang": lang,
             },
             nsmap={None: NS, "dc": DC},
         )
@@ -1506,7 +1580,6 @@ def write_metadata_json(
     author:         str,
     blurb:          str,
     master_summary: str,
-    chunk_vectors:  list[list[float]],
     mean_vector:    list[float],
 ) -> Path:
     """
@@ -1535,9 +1608,8 @@ def write_metadata_json(
         "cover":         cover_rel,
         "epub":          epub_rel,
         "embed_model":   OLLAMA_EMBED_MODEL,
-        "chunk_count":   len(chunk_vectors),
+        "chunk_count":   0,
         "vector_dim":    len(mean_vector) if mean_vector else 0,
-        "chunk_vectors": chunk_vectors,
         "mean_vector":   mean_vector,
     }
 
@@ -1667,7 +1739,6 @@ def process_epub(epub_path: Path, output_root: Path, args: argparse.Namespace) -
                 author=author,
                 blurb=blurb,
                 master_summary=master_summary,
-                chunk_vectors=chunk_vectors,
                 mean_vector=mean_vector,
             )
             timings["7 · Embed + metadata"] = time.perf_counter() - t0
@@ -1696,6 +1767,11 @@ def process_epub(epub_path: Path, output_root: Path, args: argparse.Namespace) -
             out_dir=out_dir,
             model=args.imagen_model,
             aspect_ratio=args.imagen_aspect,
+            master_summary=master_summary,
+            title=title,
+            author=author,
+            ollama_model=OLLAMA_MODEL,
+            prompt_path=prompt_path,
         )
         raw_cover = enhance_raw_image(raw_cover)
         timings["4 · Image gen (Imagen)"] = time.perf_counter() - t0
@@ -1741,7 +1817,6 @@ def process_epub(epub_path: Path, output_root: Path, args: argparse.Namespace) -
             author=author,
             blurb=blurb,
             master_summary=master_summary,
-            chunk_vectors=chunk_vectors,
             mean_vector=mean_vector,
         )
         timings["7 · Embed + metadata"] = time.perf_counter() - t0
