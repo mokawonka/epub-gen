@@ -98,7 +98,7 @@ RETRY_ATTEMPTS      = 4
 RETRY_DELAY         = 30.0              # seconds for first retry; multiplied by attempt#
 
 # Google Gemini Imagen
-IMAGEN_MODEL        = "imagen-4.0-fast-generate-001"
+IMAGEN_MODEL        = "imagen-4.0-generate-001"
 IMAGEN_ASPECT_RATIO = "3:4"             # portrait — closest to book cover ratio
 
 COVER_W             = 1400
