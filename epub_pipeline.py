@@ -1354,14 +1354,20 @@ def inject_cover_into_epub(
 
     # ── EPUB 3 nav.xhtml (replaces toc.ncx) ──────────────────────────────────
     def nav_xhtml() -> bytes:
+        # nav.xhtml lives at OEBPS/text/nav.xhtml, so hrefs are relative
+        # to OEBPS/text/ — chapters are siblings, so use bare filename only.
+        def _chap_href(arc: str) -> str:
+            # arc is e.g. "OEBPS/text/chap0014.xhtml" → "chap0014.xhtml"
+            return Path(arc).name
+
         toc_items = "\n    ".join(
-            f'<li><a href="{arc.replace("OEBPS/", "")}">{label}</a></li>'
+            f'<li><a href="{_chap_href(arc)}">{label}</a></li>'
             for arc, _, _, _, label in chap_slots
         )
         landmarks = (
-            f'<li><a epub:type="cover"      href="text/cover.xhtml">Couverture</a></li>\n    '
-            f'<li><a epub:type="titlepage"  href="text/titlepage.xhtml">Page de titre</a></li>\n    '
-            f'<li><a epub:type="bodymatter" href="{chap_slots[0][0].replace("OEBPS/", "")}">'
+            f'<li><a epub:type="cover"      href="cover.xhtml">Couverture</a></li>\n    '
+            f'<li><a epub:type="titlepage"  href="titlepage.xhtml">Page de titre</a></li>\n    '
+            f'<li><a epub:type="bodymatter" href="{_chap_href(chap_slots[0][0])}">'
             f'D&#233;but</a></li>'
             if chap_slots else ""
         )
@@ -1387,7 +1393,7 @@ def inject_cover_into_epub(
   </nav>
 </body>
 </html>""".encode("utf-8")
-
+    
     # ── Write ZIP ─────────────────────────────────────────────────────────────
     with zipfile.ZipFile(str(output_path), "w", zipfile.ZIP_DEFLATED) as zf:
         # mimetype MUST be first and uncompressed
