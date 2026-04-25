@@ -7,6 +7,7 @@ ACCESS_KEY_ID  = os.getenv("R2_ACCESS_KEY_ID")   # "Access Key ID" from R2 token
 SECRET_KEY     = os.getenv("R2_SECRET_KEY")       # "Secret Access Key" from R2 token page
 
 EXCLUDED_FOLDERS = {"chunk_checkpoints"}
+EXCLUDED_FILES   = {"cover_raw.png"} 
 INDEX_CACHE = os.path.join(os.path.dirname(__file__), ".books_index.json")
 
 s3 = boto3.client("s3",
@@ -33,6 +34,8 @@ def upload_folder(local_path):
     for root, dirs, files in os.walk(local_path):
         dirs[:] = [d for d in dirs if d not in EXCLUDED_FOLDERS]
         for filename in files:
+            if filename in EXCLUDED_FILES:
+                continue
             local_file   = os.path.join(root, filename)
             relative     = os.path.relpath(local_file, local_path)
             r2_key       = f"{folder_name}/{relative}".replace("\\", "/")
