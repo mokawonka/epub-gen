@@ -12,14 +12,15 @@ For every .epub in INPUT_FOLDER it runs, in order:
   Phase 4 – Image      : cover image via Google Gemini Imagen
   Phase 5 – Composite  : overlay title/author band on cover image
   Phase 6 – Inject     : rebuild EPUB with new cover (EPUB 3)
+  Phase 6b– Downscale  : overwrite cover_final.jpg with 500 px-wide web version
   Phase 7 – Embed      : embed chunk summaries with qwen3-embedding → metadata.json
 
 Output layout (one sub-folder per book):
 
   <output_folder>/
     <stem>/
-      <stem>_final.epub                 ← shareable: original text + cover
-      <stem>_cover_final.jpg            ← standalone cover image
+      <stem>_final.epub                 ← shareable: original text + full-res cover
+      <stem>_cover_final.jpg            ← 500 px wide web cover (overwritten after EPUB build)
       cover_raw.png                     ← raw Imagen output
       <stem>_master_summary.txt
       <stem>_image_prompt.txt
@@ -122,6 +123,10 @@ IMPRINT_BOTTOM_GAP  = 28              # pixels above the very bottom edge
 CHUNK_WORDS         = 2000
 MAX_CHUNK_TOKENS    = 3000
 
+# Web cover thumbnail — overwrites cover_final.jpg after EPUB is built
+WEB_COVER_WIDTH     = 500           # px; height is computed to preserve aspect ratio
+WEB_COVER_QUALITY   = 93            # JPEG quality for the web thumbnail
+
 FONT_PATH     = Path(__file__).parent / "LeagueSpartan-Bold.ttf"
 FALLBACK_FONT = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
 
@@ -175,18 +180,6 @@ def ollama_generate(
     model: str,
     system: str = "",
 ) -> str:
-    """
-    Call the Ollama /api/generate endpoint with aggressive retry logic.
-
-    Key changes vs. original:
-    • Uses a requests.Session so we can call session.close() from a timer
-      thread to forcibly abort a hung socket (requests has no built-in
-      hard-kill for long-running streams).
-    • OLLAMA_TIMEOUT is now the *per-attempt* deadline (300 s default).
-    • Back-off grows as  RETRY_DELAY × attempt  (30 s, 60 s, 90 s …).
-    • On final failure the exception propagates so callers can decide
-      whether to skip or crash.
-    """
     payload: dict = {"model": model, "prompt": prompt, "stream": False}
     if system:
         payload["system"] = system
@@ -484,10 +477,6 @@ def split_into_chunks_smart(
 
 
 def summarise_chunk(chunk: str, idx: int, total: int, model: str) -> str:
-    """
-    Summarise one chunk.  On repeated Ollama failure, returns a short
-    placeholder so the pipeline continues rather than crashing.
-    """
     words = chunk.split()
     if len(words) > MAX_CHUNK_TOKENS:
         chunk = " ".join(words[:MAX_CHUNK_TOKENS])
@@ -518,13 +507,9 @@ def hierarchical_summarise(
     chunk_words: int,
     chunk_model: str,
     final_model: str,
-    ckpt_dir,          # pathlib.Path
+    ckpt_dir,
     verbose:     bool = True,
 ) -> str:
-    """
-    Hierarchical summarisation with robust checkpointing.
-    Returns the master summary string.
-    """
     from pathlib import Path
 
     chunks = split_into_chunks_smart(
@@ -608,7 +593,6 @@ def hierarchical_summarise(
 # ══════════════════════════════════════════════════════════════════════════════
 
 def build_image_prompt(master_summary: str, title: str, author: str, model: str) -> str:
-    # Translate master summary to English first
     english_summary = ollama_generate(
         prompt=master_summary,
         model=model,
@@ -676,7 +660,6 @@ def build_back_cover(
     )
     raw_blurb = ollama_generate(user, model, system)
 
-    # Self-correction pass
     correction_system = (
         "Tu es un correcteur littéraire français. "
         "Corrige UNIQUEMENT les fautes de langue dans le texte suivant : "
@@ -705,10 +688,6 @@ def regenerate_image_prompt(
     master_summary: str, title: str, author: str, model: str,
     previous_prompt: str, attempt: int,
 ) -> str:
-    """
-    Regenerate the image prompt with increasingly strict safety guidance
-    after Imagen blocks a previous attempt.
-    """
     system = (
         "You are an expert image-generation prompt engineer for book covers.\n"
         "A previous prompt was blocked by an image generation safety filter.\n"
@@ -811,9 +790,8 @@ def generate_image_imagen(
                 if "blocked" in str(exc).lower() or "safety" in str(exc).lower():
                     print(f"  ⚠ {current_model} raised a safety error.")
                     continue
-                raise  # re-raise non-safety errors immediately
+                raise
 
-        # All models blocked this prompt — regenerate
         if prompt_attempt < max_prompt_attempts:
             if master_summary and title and ollama_model:
                 print(f"  ⚠ All models blocked prompt attempt {prompt_attempt} "
@@ -896,8 +874,6 @@ def composite_cover(
     img = Image.open(raw_image).convert("RGB")
     src_w, src_h = img.size
 
-    # Crop-to-fill: scale so the image covers target_w × target_h,
-    # then centre-crop — no squeezing ever.
     scale = max(target_w / src_w, target_h / src_h)
     new_w = int(src_w * scale)
     new_h = int(src_h * scale)
@@ -908,11 +884,9 @@ def composite_cover(
 
     image_h = int(target_h * IMAGE_HEIGHT_RATIO)
 
-    # Full image as base (no hard cut)
     cover = full_img.copy()
 
-    # Semi-transparent dark band over the bottom 25%
-    overlay = Image.new("RGBA", (target_w, target_h - image_h), TEXT_BAND_COLOR + (179,))  # 179 ≈ 70% opacity
+    overlay = Image.new("RGBA", (target_w, target_h - image_h), TEXT_BAND_COLOR + (179,))
     cover = cover.convert("RGBA")
     cover.paste(overlay, (0, image_h), mask=overlay)
     cover = cover.convert("RGB")
@@ -977,7 +951,6 @@ def composite_cover(
     y_after_title = _draw_lines(title_lines, title_font, block_y)
     _draw_lines(author_lines, author_font, y_after_title + 25)
 
-    # ── Imprint: "Éditions Skookoo" in golden at the very bottom ─────────────
     imprint_font = _load_font(IMPRINT_FONT_SIZE)
     imp_bbox     = draw.textbbox((0, 0), IMPRINT_TEXT, font=imprint_font)
     imp_w        = imp_bbox[2] - imp_bbox[0]
@@ -991,7 +964,35 @@ def composite_cover(
     draw.text((imp_x, imp_y), IMPRINT_TEXT, font=imprint_font, fill=IMPRINT_COLOR)
 
     cover.save(output_path, format="JPEG", quality=92)
-    print(f"  ✓  Final cover → {output_path.name}")
+    print(f"  ✓  Full-res cover → {output_path.name}  ({target_w}×{target_h}px)")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Phase 6b – Downscale cover_final.jpg to web size
+# ══════════════════════════════════════════════════════════════════════════════
+
+def downscale_cover_to_web(cover_path: Path, web_width: int = WEB_COVER_WIDTH) -> None:
+    """
+    Overwrite cover_path with a web-optimised version scaled to web_width px wide.
+    The aspect ratio is preserved.  Called AFTER the EPUB has been built so the
+    full-resolution image is safely embedded in the EPUB before we shrink it.
+    """
+    img = Image.open(cover_path).convert("RGB")
+    orig_w, orig_h = img.size
+
+    if orig_w <= web_width:
+        print(f"  ℹ  Cover is already ≤ {web_width}px wide — no downscale needed.")
+        return
+
+    ratio    = web_width / orig_w
+    web_h    = int(orig_h * ratio)
+    img      = img.resize((web_width, web_h), Image.LANCZOS)
+    img.save(cover_path, format="JPEG", quality=WEB_COVER_QUALITY, optimize=True)
+
+    size_kb = cover_path.stat().st_size / 1024
+    print(f"  ✓  Web cover → {cover_path.name}  "
+          f"({web_width}×{web_h}px, {size_kb:.1f} KB)  "
+          f"[was {orig_w}×{orig_h}px]")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1025,7 +1026,6 @@ def inject_cover_into_epub(
 
     src = epub.read_epub(str(epub_path))
 
-    # ── Detect language ───────────────────────────────────────────────────────
     lang = "fr"
     try:
         lm = src.get_metadata("DC", "language")
@@ -1036,7 +1036,6 @@ def inject_cover_into_epub(
 
     uid = f"skookoo-{epub_path.stem}"
 
-    # ── Collect spine items ───────────────────────────────────────────────────
     src_id_to_item = {
         item.id: item
         for item in src.get_items_of_type(ebooklib.ITEM_DOCUMENT)
@@ -1117,7 +1116,6 @@ def inject_cover_into_epub(
 
     cover_jpg_bytes = cover_jpg.read_bytes()
 
-    # ── Front-matter pages (EPUB 3 markup with epub:type) ────────────────────
     cover_xhtml = b"""<?xml version='1.0' encoding='utf-8'?>
 <!DOCTYPE html>
 <html xmlns="http://www.w3.org/1999/xhtml"
@@ -1237,7 +1235,6 @@ def inject_cover_into_epub(
         ("OEBPS/text/imprint.xhtml",  "application/xhtml+xml", imprint_xhtml, "imprint"),
     ]
 
-    # ── Assets ────────────────────────────────────────────────────────────────
     asset_slots = []
     asset_href_map: dict[str, str] = {}
     for item in asset_items:
@@ -1283,7 +1280,6 @@ def inject_cover_into_epub(
 
     cover_img_arc = "OEBPS/images/cover.jpg"
 
-    # ── EPUB 3 OPF ────────────────────────────────────────────────────────────
     def opf_xml() -> bytes:
         NS  = "http://www.idpf.org/2007/opf"
         DC  = "http://purl.org/dc/elements/1.1/"
@@ -1298,7 +1294,6 @@ def inject_cover_into_epub(
             nsmap={None: NS, "dc": DC},
         )
 
-        # — metadata —
         meta = etree.SubElement(root, f"{{{NS}}}metadata",
                                 nsmap={"dc": DC, "opf": NS})
         etree.SubElement(meta, f"{{{DC}}}title").text    = title
@@ -1307,11 +1302,9 @@ def inject_cover_into_epub(
         etree.SubElement(meta, f"{{{DC}}}identifier",
                          attrib={"id": "bookid"}).text   = uid
 
-        # EPUB 3 cover-image meta
         etree.SubElement(meta, f"{{{NS}}}meta",
                          attrib={"name": "cover", "content": "cover-img"})
 
-        # — manifest —
         mf = etree.SubElement(root, f"{{{NS}}}manifest")
 
         def _item(mid, href, mt, **kw):
@@ -1319,11 +1312,9 @@ def inject_cover_into_epub(
                              attrib={"id": mid, "href": href,
                                      "media-type": mt, **kw})
 
-        # nav document (EPUB 3 replaces toc.ncx)
         _item("nav", "text/nav.xhtml", "application/xhtml+xml",
               properties="nav")
 
-        # cover image with cover-image property
         _item("cover-img", "images/cover.jpg", "image/jpeg",
               properties="cover-image")
 
@@ -1339,12 +1330,10 @@ def inject_cover_into_epub(
             href = arc.replace("OEBPS/", "")
             _item(mid, href, mt)
 
-        # — spine —
         sp = etree.SubElement(root, f"{{{NS}}}spine")
-        # cover page is non-linear (decorative)
         etree.SubElement(sp, f"{{{NS}}}itemref",
                          attrib={"idref": "cover-page", "linear": "no"})
-        for _, _, _, mid in front_pages[1:]:   # titlepage + imprint
+        for _, _, _, mid in front_pages[1:]:
             etree.SubElement(sp, f"{{{NS}}}itemref", attrib={"idref": mid})
         for _, _, _, mid, _ in chap_slots:
             etree.SubElement(sp, f"{{{NS}}}itemref", attrib={"idref": mid})
@@ -1352,12 +1341,8 @@ def inject_cover_into_epub(
         return etree.tostring(root, xml_declaration=True,
                               encoding="utf-8", pretty_print=True)
 
-    # ── EPUB 3 nav.xhtml (replaces toc.ncx) ──────────────────────────────────
     def nav_xhtml() -> bytes:
-        # nav.xhtml lives at OEBPS/text/nav.xhtml, so hrefs are relative
-        # to OEBPS/text/ — chapters are siblings, so use bare filename only.
         def _chap_href(arc: str) -> str:
-            # arc is e.g. "OEBPS/text/chap0014.xhtml" → "chap0014.xhtml"
             return Path(arc).name
 
         toc_items = "\n    ".join(
@@ -1393,10 +1378,8 @@ def inject_cover_into_epub(
   </nav>
 </body>
 </html>""".encode("utf-8")
-    
-    # ── Write ZIP ─────────────────────────────────────────────────────────────
+
     with zipfile.ZipFile(str(output_path), "w", zipfile.ZIP_DEFLATED) as zf:
-        # mimetype MUST be first and uncompressed
         zf.writestr(
             zipfile.ZipInfo("mimetype"),
             "application/epub+zip",
@@ -1434,13 +1417,6 @@ def inject_cover_into_epub(
 # ══════════════════════════════════════════════════════════════════════════════
 
 def embed_texts(texts: list[str], model: str = OLLAMA_EMBED_MODEL) -> list[list[float]]:
-    """
-    Embed a list of texts using Ollama's /api/embed endpoint.
-
-    Returns a list of float vectors, one per input text.
-    Falls back gracefully: if a text fails, its slot is filled with a
-    zero-vector of the same dimension as the first successful embedding.
-    """
     if not texts:
         return []
 
@@ -1457,8 +1433,6 @@ def embed_texts(texts: list[str], model: str = OLLAMA_EMBED_MODEL) -> list[list[
                 )
                 r.raise_for_status()
                 data = r.json()
-                # Ollama /api/embed returns {"embeddings": [[...], ...]}
-                # or {"embedding": [...]} depending on version
                 if "embeddings" in data:
                     vec = data["embeddings"][0]
                 elif "embedding" in data:
@@ -1469,7 +1443,7 @@ def embed_texts(texts: list[str], model: str = OLLAMA_EMBED_MODEL) -> list[list[
                 vectors[i] = vec
                 if dim is None:
                     dim = len(vec)
-                break  # success
+                break
 
             except Exception as exc:
                 if attempt == RETRY_ATTEMPTS:
@@ -1482,7 +1456,6 @@ def embed_texts(texts: list[str], model: str = OLLAMA_EMBED_MODEL) -> list[list[
                 )
                 time.sleep(wait)
 
-    # Replace None slots with zero-vectors
     if dim is None:
         dim = 0
     for i, v in enumerate(vectors):
@@ -1493,7 +1466,6 @@ def embed_texts(texts: list[str], model: str = OLLAMA_EMBED_MODEL) -> list[list[
 
 
 def compute_mean_vector(vectors: list[list[float]]) -> list[float]:
-    """Compute the element-wise mean of a list of vectors."""
     if not vectors or not vectors[0]:
         return []
     arr = np.array(vectors, dtype=np.float64)
@@ -1501,11 +1473,6 @@ def compute_mean_vector(vectors: list[list[float]]) -> list[float]:
 
 
 def load_chunk_summaries_from_checkpoints(ckpt_dir: Path) -> list[str]:
-    """
-    Load all chunk_XXXX_summary.txt files from the checkpoint directory,
-    sorted by index. Placeholders are included as-is; callers decide
-    whether to filter them.
-    """
     files = sorted(ckpt_dir.glob("chunk_*_summary.txt"))
     summaries = []
     for f in files:
@@ -1519,19 +1486,12 @@ def generate_embeddings(
     embed_model: str,
     verbose: bool = True,
 ) -> tuple[list[list[float]], list[float]]:
-    """
-    Load chunk summaries from checkpoints, embed them, compute the mean.
-
-    Returns (chunk_vectors, mean_vector).
-    """
     summaries = load_chunk_summaries_from_checkpoints(ckpt_dir)
 
     if not summaries:
         print("  ⚠  No chunk summaries found — skipping embedding.")
         return [], []
 
-    # Filter out placeholder summaries so they don't pollute the embedding space,
-    # but keep track of total count for logging.
     valid   = [(i, s) for i, s in enumerate(summaries)
                if "[Résumé indisponible" not in s]
     skipped = len(summaries) - len(valid)
@@ -1568,7 +1528,6 @@ def generate_embeddings(
               f"Dimension: {len(mean_vec) if mean_vec else 0}. "
               f"Mean vector computed from {len(chunk_vectors_valid)} chunk(s).")
 
-    # Reconstruct full list (placeholders get zero-vectors)
     dim = len(mean_vec) if mean_vec else 0
     all_vectors: list[list[float]] = [[0.0] * dim] * len(summaries)
     valid_iter = iter(chunk_vectors_valid)
@@ -1588,12 +1547,6 @@ def write_metadata_json(
     master_summary: str,
     mean_vector:    list[float],
 ) -> Path:
-    """
-    Write metadata.json to out_dir.
-
-    Paths for "cover" and "epub" are relative to out_dir so the file
-    remains portable across machines.
-    """
     cover_final = out_dir / f"{stem}_cover_final.jpg"
     epub_final  = out_dir / f"{stem}_final.epub"
 
@@ -1802,6 +1755,15 @@ def process_epub(epub_path: Path, output_root: Path, args: argparse.Namespace) -
     timings["6 · EPUB rebuild"] = time.perf_counter() - t0
     print(f"  ⏱  {fmt_duration(timings['6 · EPUB rebuild'])}")
 
+    # ── Phase 6b : Downscale cover_final.jpg to web size ─────────────────────
+    # The full-res cover is now safely embedded in the EPUB — shrink the
+    # standalone JPEG to WEB_COVER_WIDTH px for fast loading on the website.
+    print(f"\n[6b] Downscaling cover to {WEB_COVER_WIDTH}px web version…")
+    t0 = time.perf_counter()
+    downscale_cover_to_web(final_cover, web_width=args.web_cover_width)
+    timings["6b· Web cover downscale"] = time.perf_counter() - t0
+    print(f"  ⏱  {fmt_duration(timings['6b· Web cover downscale'])}")
+
     # ── Phase 7 : Embed chunk summaries + write metadata.json ────────────────
     print("\n[7/7] Generating embeddings + writing metadata.json…")
     metadata_path = out_dir / "metadata.json"
@@ -1902,6 +1864,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--height", type=int, default=COVER_H,
                    help=f"Final cover height px (default: {COVER_H}).")
 
+    # Web cover
+    p.add_argument("--web-cover-width", type=int, default=WEB_COVER_WIDTH,
+                   help=f"Width in px of the web-optimised cover_final.jpg "
+                        f"(default: {WEB_COVER_WIDTH}). "
+                        "Overrides the full-res file AFTER the EPUB is built.")
+
     # Shortcuts
     p.add_argument("--cover-image", type=Path, default=None,
                    help="Use a pre-made cover PNG instead of calling Imagen.")
@@ -1938,6 +1906,7 @@ def main() -> None:
     print(f"  Output      : {args.output_folder.resolve()}")
     print(f"  Text models : {OLLAMA_CHUNK_MODEL} (chunk)  /  {OLLAMA_MODEL} (final)")
     print(f"  Embed model : {OLLAMA_EMBED_MODEL}")
+    print(f"  Web cover   : {args.web_cover_width}px wide")
 
     check_ollama()
 
