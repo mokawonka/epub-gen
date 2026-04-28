@@ -1,3 +1,5 @@
 output_epubs
 input_epubs
+output.pdf
+.books_index.json
 venv

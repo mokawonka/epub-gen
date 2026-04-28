@@ -3,11 +3,11 @@ from botocore.config import Config
 
 ACCOUNT_ID = "79b6f1ae5a01b8b8f23069e3b3af234e"
 BUCKET     = "editions"
-ACCESS_KEY_ID  = os.getenv("R2_ACCESS_KEY_ID")   # "Access Key ID" from R2 token page
-SECRET_KEY     = os.getenv("R2_SECRET_KEY")       # "Secret Access Key" from R2 token page
+ACCESS_KEY_ID  = os.getenv("R2_ACCESS_KEY_ID")
+SECRET_KEY     = os.getenv("R2_SECRET_KEY")
 
 EXCLUDED_FOLDERS = {"chunk_checkpoints"}
-EXCLUDED_FILES   = {"cover_raw.png"} 
+EXCLUDED_FILES   = {"cover_raw.png"}
 INDEX_CACHE = os.path.join(os.path.dirname(__file__), ".books_index.json")
 
 s3 = boto3.client("s3",
@@ -45,10 +45,15 @@ def upload_folder(local_path):
             print(f"  ✅ {r2_key}")
     return folder_name
 
-def update_index(new_folder):
+def update_index(new_folders):
+    """Accept either a single folder name (str) or a list of folder names."""
+    if isinstance(new_folders, str):
+        new_folders = [new_folders]
+
     books = load_index()
-    if new_folder not in books:
-        books.append(new_folder)
+    for folder in new_folders:
+        if folder not in books:
+            books.append(folder)
     books = sorted(books)
     save_index(books)
 
@@ -60,9 +65,19 @@ def update_index(new_folder):
 if __name__ == "__main__":
     if len(sys.argv) < 2:
         print("Usage : python upload.py /chemin/vers/dossier_livre")
+        print("        python upload.py --all /chemin/vers/dossier_parent")
         sys.exit(1)
 
-    path = sys.argv[1]
+    # Parse --all flag
+    bulk_mode = "--all" in sys.argv
+    args = [a for a in sys.argv[1:] if a != "--all"]
+
+    if not args:
+        print("❌ Aucun chemin fourni.")
+        sys.exit(1)
+
+    path = args[0]
+
     if not os.path.isdir(path):
         print(f"❌ Dossier introuvable : {path}")
         sys.exit(1)
@@ -71,6 +86,28 @@ if __name__ == "__main__":
         print("❌ R2_ACCESS_KEY_ID ou R2_SECRET_KEY manquant")
         sys.exit(1)
 
-    folder_name = upload_folder(path)
-    update_index(folder_name)
+    if bulk_mode:
+        subfolders = sorted([
+            os.path.join(path, d)
+            for d in os.listdir(path)
+            if os.path.isdir(os.path.join(path, d))
+        ])
+
+        if not subfolders:
+            print(f"❌ Aucun sous-dossier trouvé dans : {path}")
+            sys.exit(1)
+
+        print(f"📦 Mode bulk — {len(subfolders)} dossier(s) détecté(s) :")
+        for sf in subfolders:
+            print(f"  • {os.path.basename(sf)}")
+
+        uploaded = []
+        for sf in subfolders:
+            uploaded.append(upload_folder(sf))
+
+        update_index(uploaded)
+    else:
+        folder_name = upload_folder(path)
+        update_index(folder_name)
+
     print("\n🐝 Terminé !")
