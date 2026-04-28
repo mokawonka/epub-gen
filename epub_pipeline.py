@@ -180,7 +180,15 @@ def ollama_generate(
     model: str,
     system: str = "",
 ) -> str:
-    payload: dict = {"model": model, "prompt": prompt, "stream": False}
+    payload: dict = {
+        "model": model,
+        "prompt": prompt,
+        "stream": False,
+        "options": {
+            "num_thread": 6,
+        }
+    }
+    
     if system:
         payload["system"] = system
 
@@ -1428,7 +1436,7 @@ def embed_texts(texts: list[str], model: str = OLLAMA_EMBED_MODEL) -> list[list[
             try:
                 r = requests.post(
                     f"{OLLAMA_URL}/api/embed",
-                    json={"model": model, "input": text},
+                    json={"model": model, "input": text, "options": {"num_thread": 6}},
                     timeout=OLLAMA_TIMEOUT,
                 )
                 r.raise_for_status()
