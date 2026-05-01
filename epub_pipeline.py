@@ -491,15 +491,24 @@ def summarise_chunk(chunk: str, idx: int, total: int, model: str) -> str:
         chunk = " ".join(words[:MAX_CHUNK_TOKENS])
 
     system = (
-        "You are a literary analyst. "
-        "Read the provided excerpt and write a concise thematic summary in French "
-        "(100–200 words). Focus on: main characters introduced or developed, "
-        "key events, dominant mood/atmosphere, recurring symbols or motifs. "
-        "Output ONLY the summary, no preamble."
+        "Tu es un analyste littéraire. "
+        "Tu dois OBLIGATOIREMENT écrire en français. "
+        "Toute réponse en anglais est une erreur grave. "
+        "Lis l'extrait fourni et rédige un résumé thématique concis en français "
+        "(100–200 mots). Concentre-toi sur : les personnages principaux introduits "
+        "ou développés, les événements clés, l'atmosphère dominante, "
+        "les symboles ou motifs récurrents. "
+        "INTERDICTIONS ABSOLUES : n'ajoute aucune formule de politesse, aucune invite "
+        "à poser des questions, aucune mention de 'suite', aucun commentaire méta, "
+        "aucune phrase du type 'n'hésitez pas', 'à suivre', 'si vous voulez en savoir plus'. "
+        "Réponds UNIQUEMENT avec le résumé, sans préambule, en français."
     )
     try:
         return ollama_generate(
-            f"[Chunk {idx + 1} of {total}]\n\n{chunk}", model, system
+            f"[Fragment {idx + 1} sur {total}]\n\n{chunk}\n\n"
+            "Rédige le résumé EN FRANÇAIS UNIQUEMENT.",
+            model,
+            system
         )
     except Exception as exc:
         placeholder = (
@@ -509,7 +518,7 @@ def summarise_chunk(chunk: str, idx: int, total: int, model: str) -> str:
         print(f"\n  ✗ Chunk {idx + 1} permanently failed: {exc}")
         print(f"    → Placeholder saved to checkpoint so pipeline can continue.")
         return placeholder
-
+    
 
 def hierarchical_summarise(
     full_text:   str,
@@ -579,16 +588,22 @@ def hierarchical_summarise(
         f"[Chunk {i+1}]\n{s}" for i, s in enumerate(chunk_summaries)
     )
     system = (
-        "You are a senior literary editor. "
-        "Synthesise the following series of thematic summaries into one coherent "
-        "master summary in French (200–300 words) that captures the overall arc, "
-        "main characters, central themes, mood, and visual motifs of the entire work. "
-        "If a chunk summary is marked as unavailable, simply ignore it. "
-        "Output ONLY the master summary, no preamble."
+        "Tu es un éditeur littéraire senior. "
+        "Tu dois OBLIGATOIREMENT écrire en français. "
+        "Toute réponse en anglais est une erreur grave. "
+        "Synthétise les résumés suivants en un résumé maître cohérent en français "
+        "(200–300 mots) qui capture l'arc narratif global, les personnages principaux, "
+        "les thèmes centraux, l'atmosphère et les motifs visuels de l'œuvre. "
+        "Si un résumé de fragment est marqué comme indisponible, ignore-le simplement. "
+        "INTERDICTIONS ABSOLUES : n'ajoute aucune formule de politesse, aucune invite "
+        "à poser des questions, aucune mention de 'suite', aucun commentaire méta, "
+        "aucune phrase du type 'n'hésitez pas', 'à suivre', 'si vous voulez en savoir plus'. "
+        "Réponds UNIQUEMENT avec le résumé maître, sans préambule, en français."
     )
     t0     = time.perf_counter()
     master = ollama_generate(
-        f"Here are the chunk summaries:\n\n{numbered}\n\nWrite the master summary now.",
+        f"Voici les résumés des fragments :\n\n{numbered}\n\n"
+        "Rédige maintenant le résumé maître EN FRANÇAIS UNIQUEMENT.",
         final_model,
         system,
     )
