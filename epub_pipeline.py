@@ -94,9 +94,9 @@ OLLAMA_URL          = "http://localhost:11434"
 OLLAMA_MODEL        = "qwen2.5:7b"      # synthesis / final steps / blurb
 OLLAMA_CHUNK_MODEL  = "qwen2.5:7b"      # per-chunk summarise
 OLLAMA_EMBED_MODEL  = "qwen3-embedding" # embedding model for chunk summaries
-OLLAMA_TIMEOUT      = 3000              # seconds per LLM call
+OLLAMA_TIMEOUT      = 1800              # seconds per LLM call
 RETRY_ATTEMPTS      = 4
-RETRY_DELAY         = 30.0              # seconds for first retry; multiplied by attempt#
+RETRY_DELAY         = 10.0              # seconds for first retry; multiplied by attempt#
 
 # Google Gemini Imagen
 IMAGEN_MODEL        = "imagen-4.0-ultra-generate-001"
@@ -186,6 +186,7 @@ def ollama_generate(
         "stream": False,
         "options": {
             "num_thread": 6,
+            "num_predict": 1024,
         }
     }
     
