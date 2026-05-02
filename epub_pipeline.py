@@ -6,14 +6,15 @@ EPUB processing pipeline (summarise → cover → inject → embed → metadata)
 
 For every .epub in INPUT_FOLDER it runs, in order:
 
-  Phase 1 – Extract    : strip front/back matter, pull clean body text
-  Phase 2 – Summarise  : hierarchical chunk summarisation (Ollama)
-  Phase 3 – Generate   : image prompt + French back-cover blurb (Ollama)
-  Phase 4 – Image      : cover image via Google Gemini Imagen
-  Phase 5 – Composite  : overlay title/author band on cover image
-  Phase 6 – Inject     : rebuild EPUB with new cover (EPUB 3)
-  Phase 6b– Downscale  : overwrite cover_final.jpg with 500 px-wide web version
-  Phase 7 – Embed      : embed chunk summaries with qwen3-embedding → metadata.json
+  Phase 1  – Extract    : strip front/back matter, pull clean body text
+  Phase 1b – Statistics : compute French-aware text statistics
+  Phase 2  – Summarise  : hierarchical chunk summarisation (Ollama)
+  Phase 3  – Generate   : image prompt + French back-cover blurb (Ollama)
+  Phase 4  – Image      : cover image via Google Gemini Imagen
+  Phase 5  – Composite  : overlay title/author band on cover image
+  Phase 6  – Inject     : rebuild EPUB with new cover (EPUB 3)
+  Phase 6b – Downscale  : overwrite cover_final.jpg with 500 px-wide web version
+  Phase 7  – Embed      : embed chunk summaries with qwen3-embedding → metadata.json
 
 Output layout (one sub-folder per book):
 
@@ -25,9 +26,11 @@ Output layout (one sub-folder per book):
       <stem>_master_summary.txt
       <stem>_image_prompt.txt
       <stem>_quatrieme_de_couverture.txt
+      <stem>_stats.json                 ← text statistics checkpoint
       metadata.json                     ← title, author, blurb, summary,
                                            cover path, epub path,
-                                           chunk_vectors, mean_vector
+                                           chunk_vectors, mean_vector,
+                                           stats (text statistics)
       chunk_checkpoints/
         chunk_0000_summary.txt          ← per-chunk summary (resume)
 
@@ -62,6 +65,7 @@ import re
 import sys
 import threading
 import time
+from collections import Counter
 from pathlib import Path
 
 import requests
@@ -91,8 +95,8 @@ except ImportError:
 # ══════════════════════════════════════════════════════════════════════════════
 
 OLLAMA_URL          = "http://localhost:11434"
-OLLAMA_MODEL        = "qwen2.5:7b"      # synthesis / final steps / blurb
-OLLAMA_CHUNK_MODEL  = "qwen2.5:7b"      # per-chunk summarise
+OLLAMA_MODEL        = "mistral-nemo"      # synthesis / final steps / blurb
+OLLAMA_CHUNK_MODEL  = "mistral-nemo"      # per-chunk summarise
 OLLAMA_EMBED_MODEL  = "qwen3-embedding" # embedding model for chunk summaries
 OLLAMA_TIMEOUT      = 1800              # seconds per LLM call
 RETRY_ATTEMPTS      = 4
@@ -129,6 +133,9 @@ WEB_COVER_QUALITY   = 93            # JPEG quality for the web thumbnail
 
 FONT_PATH     = Path(__file__).parent / "LeagueSpartan-Bold.ttf"
 FALLBACK_FONT = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+
+# Average reading speed in words per minute (French prose)
+READING_WPM = 200
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Utilities
@@ -186,7 +193,6 @@ def ollama_generate(
         "stream": False,
         "options": {
             "num_thread": 6,
-            "num_predict": 1024,
         }
     }
     
@@ -421,6 +427,361 @@ def load_epub_text_and_meta(epub_path: Path) -> tuple[str, str, str, int]:
     full_text   = "\n\n".join(t for t in texts if t)
     total_words = len(full_text.split())
     return full_text, title, author, total_words
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Phase 1b – Text Statistics (French-aware)
+# ══════════════════════════════════════════════════════════════════════════════
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _count_french_syllables(word: str) -> int:
+    """
+    Heuristic French syllable counter.
+    Counts vowel groups (including accented vowels), with common French rules:
+      – silent final 'e' after a consonant is not counted
+      – 'eau', 'au', 'ai', 'ei', 'oi', 'ou', 'eu', 'oeu' count as 1 syllable
+      – minimum 1 syllable per word
+    """
+    w = word.lower().strip(".,;:!?\"'«»—–-()[]{}")
+    if not w:
+        return 0
+
+    VOWELS = "aeiouyàâäéèêëîïôöùûüœæ"
+
+    # Merge common French digraphs / trigraphs into a single placeholder
+    for digraph in ("eau", "oeu", "oei", "au", "ai", "ei", "oi", "ou", "eu", "ae", "oe"):
+        w = w.replace(digraph, "V")
+
+    # Now replace remaining single vowels
+    w = re.sub(f"[{VOWELS}]", "V", w)
+
+    # Remove silent final 'e' (not after another vowel)
+    if w.endswith("Ve") or (w.endswith("e") and len(w) > 1 and w[-2] != "V"):
+        w = w[:-1]
+
+    count = w.count("V")
+    return max(count, 1)
+
+
+def _tokenize_words_fr(text: str) -> list[str]:
+    """Return lowercase alphabetic tokens (handles French apostrophes)."""
+    # Normalise typographic apostrophes
+    text = text.replace("\u2019", "'").replace("\u2018", "'")
+    # Keep only alphabetic chars and apostrophes, split on everything else
+    tokens = re.findall(r"[a-zA-ZÀ-ÿœæ]+(?:'[a-zA-ZÀ-ÿœæ]+)*", text)
+    return [t.lower() for t in tokens]
+
+
+def _split_sentences_fr(text: str) -> list[str]:
+    """
+    Split French prose into sentences.
+    Handles '.' '!' '?' as terminators; skips common French abbreviations
+    (M. Mme. Dr. etc.) to avoid false splits.
+    """
+    # Common French honorifics / abbreviations that should NOT end a sentence
+    ABBREVS = re.compile(
+        r"\b(M|Mme|Mlle|MM|Dr|Pr|Me|St|Ste|Sr|Jr|vol|art|chap|fig|ex|cf|"
+        r"éd|trad|ibid|op|cit|p|pp|vs|env|env|apr|av|etc)\.$",
+        re.IGNORECASE,
+    )
+
+    # Protect abbreviations by temporarily replacing their period
+    protected = re.sub(
+        r"\b(M|Mme|Mlle|MM|Dr|Pr|Me|St|Ste|Sr|Jr|vol|art|chap|fig|ex|cf|"
+        r"éd|trad|ibid|op|cit|p|pp|vs|env|apr|av|etc)\.",
+        r"\1<DOT>",
+        text,
+        flags=re.IGNORECASE,
+    )
+    # Split on sentence-ending punctuation followed by space/newline + uppercase
+    parts = re.split(r"(?<=[.!?…])\s+(?=[«\"'\u2018\u2019A-ZÀÂÄÉÈÊËÎÏÔÖÙÛÜŒÆ])", protected)
+    # Restore protected dots
+    sentences = [p.replace("<DOT>", ".").strip() for p in parts if p.strip()]
+    return sentences if sentences else [text]
+
+
+def _split_paragraphs(text: str) -> list[str]:
+    """Split on blank lines; filter very short artefacts (headings, scene breaks)."""
+    paras = re.split(r"\n{2,}", text)
+    return [
+        p.strip() for p in paras
+        if p.strip()
+        and not re.match(r"^(===|---).*", p.strip())
+        and len(p.split()) >= 5
+    ]
+
+
+def _count_chapters(text: str) -> int:
+    """Count HEADING markers inserted by the extractor."""
+    return max(len(re.findall(r"^=== HEADING:", text, re.MULTILINE)), 1)
+
+
+def _dialogue_ratio(text: str) -> float:
+    """
+    Estimate the fraction of words inside dialogue markers.
+    Handles four French conventions:
+      1. Guillemets  «…»
+      2. Em-dash lines  – / — at line start
+      3. Play scripts with proper line breaks (SPEAKER on its own line)
+      4. Play scripts collapsed into a single line per scene:
+         "Gorgibus Bonjour. Sganarelle Oui, merci." — speaker names inline
+    """
+    total_words = len(text.split())
+    if total_words == 0:
+        return 0.0
+
+    dialogue_words = 0
+
+    # Pre-compile patterns
+    SPEAKER_RE = re.compile(
+        r"^[A-ZÀÂÄÉÈÊËÎÏÔÖÙÛÜŒÆ\s\-\.']{2,40}[.:\,]?\s*$"
+    )
+    STAGE_DIR_RE = re.compile(r"^\s*\(.*\)\s*$")
+    SCENE_HDR_RE = re.compile(
+        r"^(acte|scène|scene|tableau|prologue|épilogue|fin)\b",
+        re.IGNORECASE,
+    )
+    # Matches an inline speaker name: one or more capitalised words (possibly
+    # hyphenated or with apostrophe) that appear mid-line before speech.
+    # e.g. "Gorgibus", "Gros-René", "L'Avocat"
+    INLINE_SPEAKER_RE = re.compile(
+        r"(?<![a-zàâäéèêëîïôöùûüœæ])"   # not preceded by a lowercase letter
+        r"([A-ZÀÂÄÉÈÊËÎÏÔÖÙÛÜŒÆ][a-zA-ZÀ-ÿœæ\-']*"
+        r"(?:\s+[A-ZÀÂÄÉÈÊËÎÏÔÖÙÛÜŒÆ][a-zA-ZÀ-ÿœæ\-']*){0,3})"
+        r"(?=\s+[«A-ZÀ-ÿœæa-z\"\-–—])"  # followed by speech
+    )
+
+    # ── Convention 1 : guillemets ─────────────────────────────────────────
+    for span in re.finditer(r"«[^»]{1,2000}»", text):
+        dialogue_words += len(span.group().split())
+
+    lines = text.splitlines()
+
+    i = 0
+    while i < len(lines):
+        line = lines[i].strip()
+
+        # Skip empty lines and structural markers
+        if not line or SCENE_HDR_RE.match(line) or line.startswith("==="):
+            i += 1
+            continue
+
+        # ── Convention 2 : em-dash ────────────────────────────────────────
+        if line.startswith(("–", "—", "- ")):
+            dialogue_words += len(line.split())
+            i += 1
+            continue
+
+        # ── Convention 3 : proper line-break script ───────────────────────
+        if SPEAKER_RE.match(line) and not STAGE_DIR_RE.match(line):
+            i += 1
+            while i < len(lines):
+                speech = lines[i].strip()
+                if not speech:
+                    i += 1
+                    continue
+                if (
+                    SPEAKER_RE.match(speech)
+                    or STAGE_DIR_RE.match(speech)
+                    or SCENE_HDR_RE.match(speech)
+                ):
+                    break
+                dialogue_words += len(speech.split())
+                i += 1
+            continue
+
+        # ── Convention 4 : collapsed scene line ───────────────────────────
+        # Split the line on inline speaker name boundaries, then count
+        # everything after each speaker name as dialogue.
+        #
+        # Strategy: find all speaker-name positions in the line, then treat
+        # the text between consecutive speaker positions as speech.
+        matches = list(INLINE_SPEAKER_RE.finditer(line))
+        if matches:
+            # Collect (start_of_speech, end_of_speech) spans
+            for idx, m in enumerate(matches):
+                speech_start = m.end()
+                speech_end   = matches[idx + 1].start() if idx + 1 < len(matches) else len(line)
+                speech_text  = line[speech_start:speech_end].strip()
+                # Strip leading stage directions in parentheses
+                speech_text  = re.sub(r"^\(.*?\)\s*", "", speech_text)
+                dialogue_words += len(speech_text.split())
+
+        i += 1
+
+    return round(min(dialogue_words / total_words * 100, 100.0), 2)
+
+
+def _lexical_diversity_msttr(tokens: list[str], window: int = 500) -> float:
+    """
+    Mean Segmental Type-Token Ratio (MSTTR) — more stable than raw TTR for
+    long texts.  Splits the token list into non-overlapping windows of `window`
+    tokens and averages the TTR of each window.
+    """
+    if not tokens:
+        return 0.0
+    ttrs = []
+    for i in range(0, len(tokens) - window + 1, window):
+        seg = tokens[i : i + window]
+        ttrs.append(len(set(seg)) / len(seg))
+    if not ttrs:
+        # corpus shorter than one window — plain TTR
+        ttrs = [len(set(tokens)) / len(tokens)]
+    return round(sum(ttrs) / len(ttrs) * 100, 2)
+
+
+def _hapax_legomena_ratio(tokens: list[str]) -> float:
+    """Words appearing exactly once / total vocabulary × 100."""
+    if not tokens:
+        return 0.0
+    freq = Counter(tokens)
+    hapax_count = sum(1 for f in freq.values() if f == 1)
+    return round(hapax_count / len(freq) * 100, 2)
+
+
+def _kandel_moles(avg_sentence_len: float, avg_syllables_per_word: float) -> float:
+    """
+    Kandel & Moles (1958) French readability formula:
+        FK = 209 − 1.15 × L − 68.48 × C
+    where L = average sentence length in words,
+          C = average number of syllables per word.
+
+    Score interpretation (higher = easier):
+      ≥ 100  : very easy (children's books)
+        60–100: standard / easy
+        30–60 : moderately difficult
+         0–30 : difficult (academic / technical)
+       < 0    : very difficult
+    """
+    score = 209 - 1.15 * avg_sentence_len - 68.48 * avg_syllables_per_word
+    return round(score, 2)
+
+
+def compute_text_statistics(body_text: str, verbose: bool = True) -> dict:
+    """
+    Compute French-aware text statistics from the extracted body text.
+
+    Returns a dict with all metrics ready to be serialised to JSON.
+    """
+    if verbose:
+        print("  → Tokenising words…", flush=True)
+    tokens = _tokenize_words_fr(body_text)
+    word_count = len(tokens)
+
+    if verbose:
+        print("  → Splitting sentences…", flush=True)
+    sentences = _split_sentences_fr(body_text)
+    sentence_count = len(sentences)
+
+    if verbose:
+        print("  → Splitting paragraphs…", flush=True)
+    paragraphs = _split_paragraphs(body_text)
+    paragraph_count = len(paragraphs)
+
+    chapter_count = _count_chapters(body_text)
+
+    # Average lengths
+    avg_sentence_len  = round(word_count / sentence_count, 2)   if sentence_count  else 0.0
+    avg_paragraph_len = round(word_count / paragraph_count, 2)  if paragraph_count else 0.0
+    avg_chapter_len   = round(word_count / chapter_count, 2)    if chapter_count   else 0.0
+
+    # Syllable stats (sample up to 20 000 tokens for speed)
+    if verbose:
+        print("  → Computing syllable counts (Kandel-Moles)…", flush=True)
+    sample_tokens = tokens[:20_000]
+    if sample_tokens:
+        total_syllables = sum(_count_french_syllables(w) for w in sample_tokens)
+        avg_syllables   = total_syllables / len(sample_tokens)
+    else:
+        avg_syllables = 0.0
+
+    kandel_moles_score = _kandel_moles(avg_sentence_len, avg_syllables)
+
+    # Reading time
+    reading_time_minutes = round(word_count / READING_WPM, 1) if word_count else 0.0
+
+    # Dialogue ratio
+    if verbose:
+        print("  → Computing dialogue ratio…", flush=True)
+    dialogue_pct = _dialogue_ratio(body_text)
+
+    # Lexical diversity (MSTTR)
+    if verbose:
+        print("  → Computing lexical diversity (MSTTR-500)…", flush=True)
+    lexical_diversity = _lexical_diversity_msttr(tokens, window=500)
+
+    # Hapax legomena
+    if verbose:
+        print("  → Computing hapax legomena…", flush=True)
+    hapax_pct = _hapax_legomena_ratio(tokens)
+
+    stats: dict = {
+        # Counts
+        "word_count":              word_count,
+        "sentence_count":          sentence_count,
+        "paragraph_count":         paragraph_count,
+        "chapter_count":           chapter_count,
+        # Averages
+        "avg_sentence_length":     avg_sentence_len,
+        "avg_paragraph_length":    avg_paragraph_len,
+        "avg_chapter_length":      avg_chapter_len,
+        # Readability
+        "kandel_moles_score":      kandel_moles_score,
+        "avg_syllables_per_word":  round(avg_syllables, 3),
+        # Reader-facing
+        "estimated_reading_time_minutes": reading_time_minutes,
+        "dialogue_ratio_pct":      dialogue_pct,
+        # Vocabulary richness
+        "lexical_diversity_msttr": lexical_diversity,
+        "hapax_legomena_pct":      hapax_pct,
+    }
+
+    if verbose:
+        _print_stats(stats)
+
+    return stats
+
+
+def _print_stats(stats: dict) -> None:
+    """Pretty-print the computed statistics."""
+    km   = stats["kandel_moles_score"]
+    if km >= 100:
+        km_label = "très facile"
+    elif km >= 60:
+        km_label = "facile / standard"
+    elif km >= 30:
+        km_label = "modérément difficile"
+    elif km >= 0:
+        km_label = "difficile"
+    else:
+        km_label = "très difficile"
+
+    rt = stats["estimated_reading_time_minutes"]
+    if rt < 60:
+        rt_str = f"{rt:.0f} min"
+    else:
+        h = int(rt // 60)
+        m = int(rt % 60)
+        rt_str = f"{h}h {m:02d}min"
+
+    print(f"\n  ┌── Text Statistics ─────────────────────────────────┐")
+    print(f"  │  Words              : {stats['word_count']:>10,}                   │")
+    print(f"  │  Sentences          : {stats['sentence_count']:>10,}                   │")
+    print(f"  │  Paragraphs         : {stats['paragraph_count']:>10,}                   │")
+    print(f"  │  Chapters           : {stats['chapter_count']:>10,}                   │")
+    print(f"  │  Avg sentence len   : {stats['avg_sentence_length']:>10.1f} words               │")
+    print(f"  │  Avg paragraph len  : {stats['avg_paragraph_length']:>10.1f} words               │")
+    print(f"  │  Avg chapter len    : {stats['avg_chapter_length']:>10.1f} words               │")
+    print(f"  │  Kandel-Moles score : {km:>10.1f}  ({km_label})    │")
+    print(f"  │  Avg syllables/word : {stats['avg_syllables_per_word']:>10.3f}                   │")
+    print(f"  │  Est. reading time  : {rt_str:>10}                   │")
+    print(f"  │  Dialogue ratio     : {stats['dialogue_ratio_pct']:>9.1f} %                   │")
+    print(f"  │  Lexical diversity  : {stats['lexical_diversity_msttr']:>9.1f} %  (MSTTR-500)    │")
+    print(f"  │  Hapax legomena     : {stats['hapax_legomena_pct']:>9.1f} %  of vocabulary    │")
+    print(f"  └────────────────────────────────────────────────────┘")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1570,6 +1931,7 @@ def write_metadata_json(
     blurb:          str,
     master_summary: str,
     mean_vector:    list[float],
+    stats:          dict | None = None,
 ) -> Path:
     cover_final = out_dir / f"{stem}_cover_final.jpg"
     epub_final  = out_dir / f"{stem}_final.epub"
@@ -1595,6 +1957,9 @@ def write_metadata_json(
         "vector_dim":    len(mean_vector) if mean_vector else 0,
         "mean_vector":   mean_vector,
     }
+
+    if stats is not None:
+        metadata["stats"] = stats
 
     out_path = out_dir / "metadata.json"
     with open(out_path, "w", encoding="utf-8") as f:
@@ -1622,7 +1987,7 @@ def process_epub(epub_path: Path, output_root: Path, args: argparse.Namespace) -
     section(f"📖  {epub_path.name}")
 
     # ── Phase 1 : Extract text ────────────────────────────────────────────────
-    print("\n[1/7] Extracting body text from EPUB…")
+    print("\n[1/8] Extracting body text from EPUB…")
     t0 = time.perf_counter()
     body_text, title, author, word_count = load_epub_text_and_meta(epub_path)
     timings["1 · Extract text"] = time.perf_counter() - t0
@@ -1631,15 +1996,36 @@ def process_epub(epub_path: Path, output_root: Path, args: argparse.Namespace) -
     print(f"  Body words : {word_count:,}  (front/back matter excluded)")
     print(f"  ⏱  {fmt_duration(timings['1 · Extract text'])}")
 
+    # ── Phase 1b : Text Statistics ────────────────────────────────────────────
+    stats_path = out_dir / f"{stem}_stats.json"
+
+    if stats_path.exists():
+        print(f"\n[1b/8] Text statistics: loaded from checkpoint.")
+        with open(stats_path, encoding="utf-8") as f:
+            text_stats = json.load(f)
+        timings["1b· Text statistics"] = 0.0
+        _print_stats(text_stats)
+    else:
+        print(f"\n[1b/8] Computing French text statistics…")
+        t0 = time.perf_counter()
+        text_stats = compute_text_statistics(body_text, verbose=True)
+        timings["1b· Text statistics"] = time.perf_counter() - t0
+
+        with open(stats_path, "w", encoding="utf-8") as f:
+            json.dump(text_stats, f, ensure_ascii=False, indent=2)
+        size_kb = stats_path.stat().st_size / 1024
+        print(f"  ✓  Stats checkpoint → {stats_path.name}  ({size_kb:.1f} KB)")
+        print(f"  ⏱  {fmt_duration(timings['1b· Text statistics'])}")
+
     # ── Phase 2 : Hierarchical summarisation ─────────────────────────────────
     summary_path = out_dir / f"{stem}_master_summary.txt"
 
     if summary_path.exists():
-        print(f"\n[2/7] Master summary: loaded from checkpoint.")
+        print(f"\n[2/8] Master summary: loaded from checkpoint.")
         master_summary = summary_path.read_text(encoding="utf-8")
         timings["2 · Hierarchical summarise"] = 0.0
     else:
-        print(f"\n[2/7] Hierarchical summarisation…")
+        print(f"\n[2/8] Hierarchical summarisation…")
         print(f"  Chunk model : {OLLAMA_CHUNK_MODEL}")
         print(f"  Final model : {OLLAMA_MODEL}")
         t0 = time.perf_counter()
@@ -1657,7 +2043,7 @@ def process_epub(epub_path: Path, output_root: Path, args: argparse.Namespace) -
         print(f"  ⏱  {fmt_duration(timings['2 · Hierarchical summarise'])}")
 
     # ── Phase 3 : Image prompt + back-cover blurb ────────────────────────────
-    print(f"\n[3/7] Building image prompt + back-cover blurb ({OLLAMA_MODEL})…")
+    print(f"\n[3/8] Building image prompt + back-cover blurb ({OLLAMA_MODEL})…")
 
     prompt_path = out_dir / f"{stem}_image_prompt.txt"
 
@@ -1702,11 +2088,11 @@ def process_epub(epub_path: Path, output_root: Path, args: argparse.Namespace) -
 
     if args.only_blurb:
         print("\n  --only-blurb set: skipping image generation and EPUB rebuild.")
-        print("\n[7/7] Generating embeddings + writing metadata.json…")
+        print("\n[8/8] Generating embeddings + writing metadata.json…")
         metadata_path = out_dir / "metadata.json"
         if metadata_path.exists():
             print(f"  → metadata.json already exists — skipping embeddings.")
-            timings["7 · Embed + metadata"] = 0.0
+            timings["8 · Embed + metadata"] = 0.0
         else:
             t0 = time.perf_counter()
             chunk_vectors, mean_vector = generate_embeddings(
@@ -1723,9 +2109,10 @@ def process_epub(epub_path: Path, output_root: Path, args: argparse.Namespace) -
                 blurb=blurb,
                 master_summary=master_summary,
                 mean_vector=mean_vector,
+                stats=text_stats,
             )
-            timings["7 · Embed + metadata"] = time.perf_counter() - t0
-            print(f"  ⏱  {fmt_duration(timings['7 · Embed + metadata'])}")
+            timings["8 · Embed + metadata"] = time.perf_counter() - t0
+            print(f"  ⏱  {fmt_duration(timings['8 · Embed + metadata'])}")
         _print_timings(timings, t_book, out_dir, stem)
         return
 
@@ -1734,7 +2121,7 @@ def process_epub(epub_path: Path, output_root: Path, args: argparse.Namespace) -
     cached_raw = out_dir / "cover_raw.png"
 
     if raw_cover is None and cached_raw.exists():
-        print(f"\n[4/7] cover_raw.png found in output folder — skipping image generation.")
+        print(f"\n[4/8] cover_raw.png found in output folder — skipping image generation.")
         raw_cover = cached_raw
         timings["4 · Image gen (Imagen)"] = 0.0
     elif raw_cover is None:
@@ -1743,7 +2130,7 @@ def process_epub(epub_path: Path, output_root: Path, args: argparse.Namespace) -
             ollama_unload(m)
         time.sleep(2)
 
-        print(f"\n[4/7] Generating cover image with Imagen…")
+        print(f"\n[4/8] Generating cover image with Imagen…")
         t0 = time.perf_counter()
         raw_cover = generate_image_imagen(
             prompt=image_prompt,
@@ -1760,11 +2147,11 @@ def process_epub(epub_path: Path, output_root: Path, args: argparse.Namespace) -
         timings["4 · Image gen (Imagen)"] = time.perf_counter() - t0
         print(f"  ⏱  {fmt_duration(timings['4 · Image gen (Imagen)'])}")
     else:
-        print(f"\n[4/7] Using provided cover image: {raw_cover}")
+        print(f"\n[4/8] Using provided cover image: {raw_cover}")
         timings["4 · Image gen (Imagen)"] = 0.0
 
     # ── Phase 5 : Composite cover ─────────────────────────────────────────────
-    print("\n[5/7] Compositing cover…")
+    print("\n[5/8] Compositing cover…")
     t0 = time.perf_counter()
     final_cover = out_dir / f"{stem}_cover_final.jpg"
     composite_cover(raw_cover, title, author, final_cover, args.width, args.height)
@@ -1772,7 +2159,7 @@ def process_epub(epub_path: Path, output_root: Path, args: argparse.Namespace) -
     print(f"  ⏱  {fmt_duration(timings['5 · Composite cover'])}")
 
     # ── Phase 6 : Inject cover into the original EPUB ────────────────────────
-    print("\n[6/7] Rebuilding EPUB 3 with new cover…")
+    print("\n[6/8] Rebuilding EPUB 3 with new cover…")
     t0 = time.perf_counter()
     final_epub = out_dir / f"{stem}_final.epub"
     inject_cover_into_epub(epub_path, final_cover, final_epub, title=title, author=author)
@@ -1780,20 +2167,18 @@ def process_epub(epub_path: Path, output_root: Path, args: argparse.Namespace) -
     print(f"  ⏱  {fmt_duration(timings['6 · EPUB rebuild'])}")
 
     # ── Phase 6b : Downscale cover_final.jpg to web size ─────────────────────
-    # The full-res cover is now safely embedded in the EPUB — shrink the
-    # standalone JPEG to WEB_COVER_WIDTH px for fast loading on the website.
-    print(f"\n[6b] Downscaling cover to {WEB_COVER_WIDTH}px web version…")
+    print(f"\n[6b/8] Downscaling cover to {WEB_COVER_WIDTH}px web version…")
     t0 = time.perf_counter()
     downscale_cover_to_web(final_cover, web_width=args.web_cover_width)
     timings["6b· Web cover downscale"] = time.perf_counter() - t0
     print(f"  ⏱  {fmt_duration(timings['6b· Web cover downscale'])}")
 
     # ── Phase 7 : Embed chunk summaries + write metadata.json ────────────────
-    print("\n[7/7] Generating embeddings + writing metadata.json…")
+    print("\n[7/8] Generating embeddings…")
     metadata_path = out_dir / "metadata.json"
     if metadata_path.exists():
         print(f"  → metadata.json already exists — skipping embeddings.")
-        timings["7 · Embed + metadata"] = 0.0
+        timings["7 · Embed"] = 0.0
     else:
         t0 = time.perf_counter()
         chunk_vectors, mean_vector = generate_embeddings(
@@ -1801,6 +2186,11 @@ def process_epub(epub_path: Path, output_root: Path, args: argparse.Namespace) -
             embed_model=args.embed_model,
             verbose=True,
         )
+        timings["7 · Embed"] = time.perf_counter() - t0
+        print(f"  ⏱  {fmt_duration(timings['7 · Embed'])}")
+
+        print("\n[8/8] Writing metadata.json…")
+        t0 = time.perf_counter()
         write_metadata_json(
             out_dir=out_dir,
             epub_path=epub_path,
@@ -1810,9 +2200,10 @@ def process_epub(epub_path: Path, output_root: Path, args: argparse.Namespace) -
             blurb=blurb,
             master_summary=master_summary,
             mean_vector=mean_vector,
+            stats=text_stats,
         )
-        timings["7 · Embed + metadata"] = time.perf_counter() - t0
-        print(f"  ⏱  {fmt_duration(timings['7 · Embed + metadata'])}")
+        timings["8 · Metadata"] = time.perf_counter() - t0
+        print(f"  ⏱  {fmt_duration(timings['8 · Metadata'])}")
 
     _print_timings(timings, t_book, out_dir, stem)
 
