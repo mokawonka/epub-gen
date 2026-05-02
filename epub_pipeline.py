@@ -124,8 +124,8 @@ IMPRINT_SHADOW      = (0, 0, 0)
 IMPRINT_FONT_SIZE   = 36               # px — adjust to taste
 IMPRINT_BOTTOM_GAP  = 28              # pixels above the very bottom edge
 
-CHUNK_WORDS         = 2000
-MAX_CHUNK_TOKENS    = 3000
+CHUNK_WORDS         = 6000
+MAX_CHUNK_TOKENS    = 7000
 
 # Web cover thumbnail — overwrites cover_final.jpg after EPUB is built
 WEB_COVER_WIDTH     = 500           # px; height is computed to preserve aspect ratio
@@ -790,9 +790,9 @@ def _print_stats(stats: dict) -> None:
 
 def split_into_chunks_smart(
     text: str,
-    target_words: int = 2000,
-    min_words: int    = 500,
-    max_words: int    = 3500,
+    target_words: int = 6000,
+    min_words: int    = 2000,
+    max_words: int    = 7000,
 ) -> list[str]:
     HEADING_RE = re.compile(r'^=== HEADING:.*===$')
     SCENE_RE   = re.compile(r'^--- SCENE ---$')
@@ -837,9 +837,11 @@ def split_into_chunks_smart(
 
     flush()
 
+    MERGE_FLOOR = 2000
+
     merged: list[str] = []
     for chunk in chunks:
-        if merged and len(chunk.split()) < min_words:
+        if merged and len(chunk.split()) < MERGE_FLOOR:
             merged[-1] += "\n\n" + chunk
         else:
             merged.append(chunk)
@@ -894,8 +896,8 @@ def hierarchical_summarise(
     chunks = split_into_chunks_smart(
         full_text,
         target_words=chunk_words,
-        min_words = max(400, int(chunk_words * 0.20)),
-        max_words=chunk_words + 800,
+        min_words = 2000,
+        max_words=chunk_words + 1000,
     )
     n = len(chunks)
     if verbose:
