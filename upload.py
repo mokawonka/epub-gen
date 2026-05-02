@@ -6,7 +6,7 @@ BUCKET     = "editions"
 ACCESS_KEY_ID  = os.getenv("R2_ACCESS_KEY_ID")
 SECRET_KEY     = os.getenv("R2_SECRET_KEY")
 
-EXCLUDED_FOLDERS = {"chunk_checkpoints"}
+EXCLUDED_FOLDERS = {}
 EXCLUDED_FILES   = {"cover_raw.png"}
 INDEX_CACHE = os.path.join(os.path.dirname(__file__), ".books_index.json")
 
